@@ -93,7 +93,7 @@ jobs:
           mode: onefile
           enable-plugins: tk-inter
           include-data-dir: static=static
-          output-file: VideoQC_Mac.bin
+          output-file: VideoQC_Mac.command
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
