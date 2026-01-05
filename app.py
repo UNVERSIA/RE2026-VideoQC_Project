@@ -1,0 +1,710 @@
+import os
+import sys
+import cv2
+import json
+import datetime
+import re
+import socket
+import threading
+import webbrowser
+import platform
+import subprocess
+from threading import Timer
+import tkinter as tk
+from tkinter import filedialog
+from flask import Flask, render_template_string, request, jsonify, session, redirect
+
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    full_path = os.path.join(base_path, relative_path)
+    return full_path
+
+
+static_dir = resource_path('static')
+print(f"DEBUG: Static dir: {static_dir}")
+
+app = Flask(__name__, static_folder=static_dir)
+app.secret_key = 'video_qc_secret_key_2025'
+
+STANDARDS = {
+    "target_fps": 30,
+    "fps_tolerance": 0.5,
+    "format": ".mp4",
+    "min_width": 2800,
+    "min_height": 2100,
+    "target_ratio": 4 / 3,
+    "ratio_tolerance": 0.05
+}
+HISTORY_FILE = 'qc_history_db.json'
+
+# --- 时长标准 ---
+DURATION_Threshold_Folder = 6 * 3600  # 单文件夹有效时长需达标 6小时
+DURATION_Threshold_Avg = 7 * 3600  # 平均时长 7小时
+
+
+# 寻找空闲端口
+def find_free_port(start_port=5000):
+    port = start_port
+    while port < 65535:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            result = sock.connect_ex(('127.0.0.1', port))
+            if result != 0:
+                return port
+            else:
+                port += 1
+    return 5000
+
+
+# 后端存储
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+
+def save_history_record(record):
+    history = load_history()
+    history.append(record)
+    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+# --- macOS 弹窗优化  ---
+def open_folder_dialog():
+    system_name = platform.system()
+
+    if system_name == 'Darwin':
+        osa_cmd = '/usr/bin/osascript'
+
+        script_finder = '''
+        tell application "Finder"
+            activate
+            try
+                set f to choose folder with prompt "请选择包含视频的文件夹"
+                return POSIX path of f
+            on error
+                return "CANCEL"
+            end try
+        end tell
+        '''
+
+        script_sys = '''
+        tell application "System Events"
+            activate
+            try
+                set f to choose folder with prompt "请选择包含视频的文件夹"
+                return POSIX path of f
+            on error
+                return "CANCEL"
+            end try
+        end tell
+        '''
+
+        try:
+            # 1. 尝试 Finder 弹窗
+            result = subprocess.run([osa_cmd, '-e', script_finder], capture_output=True, text=True, timeout=60)
+            output = result.stdout.strip()
+
+            if "CANCEL" in output: return ""
+            if output: return output
+
+            # 2. 如果 Finder 失败（通常是没返回路径），尝试 System Events
+            print("Finder 调用失败，尝试 System Events...")
+            result = subprocess.run([osa_cmd, '-e', script_sys], capture_output=True, text=True, timeout=60)
+            output = result.stdout.strip()
+
+            if "CANCEL" in output: return ""
+            if output: return output
+
+            return ""
+
+        except subprocess.TimeoutExpired:
+            print("macOS Dialog Timeout")
+            return ""
+        except Exception as e:
+            print(f"macOS Dialog Error: {e}")
+            return ""
+
+    else:
+        # Windows / Linux 逻辑不变
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            folder_path = filedialog.askdirectory(title="选择文件夹")
+            root.destroy()
+            return folder_path
+        except Exception as e:
+            print(f"Tkinter Error: {e}")
+            return ""
+
+
+def clean_path(path_str):
+    if not path_str: return ""
+    p = path_str.strip()
+    if p.startswith('"') and p.endswith('"'): p = p[1:-1]
+    if p.startswith("'") and p.endswith("'"): p = p[1:-1]
+    return os.path.normpath(p)
+
+
+def format_duration(seconds):
+    if seconds is None: return "00:00:00"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def get_video_info(file_path):
+    try:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return None, "无法读取文件"
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        duration_sec = 0
+        if fps > 0:
+            duration_sec = frame_count / fps
+
+        cap.release()
+
+        ext = os.path.splitext(file_path)[1].lower()
+        ratio = width / height if height > 0 else 0
+
+        check_format = ext == STANDARDS['format']
+        check_fps = abs(fps - STANDARDS['target_fps']) <= STANDARDS['fps_tolerance']
+        check_res = width >= STANDARDS['min_width'] and height >= STANDARDS['min_height']
+        check_ratio = abs(ratio - STANDARDS['target_ratio']) <= STANDARDS['ratio_tolerance']
+        is_passed = check_format and check_fps and check_res and check_ratio
+
+        reasons = []
+        if not check_format: reasons.append(f"格式错误({ext})")
+        if not check_fps: reasons.append(f"帧率异常({round(fps, 2)})")
+        if not check_res: reasons.append(f"分辨率不足({width}x{height})")
+        if not check_ratio: reasons.append(f"比例错误({round(ratio, 2)})")
+
+        return {
+            "filename": os.path.basename(file_path),
+            "width": width,
+            "height": height,
+            "fps": round(fps, 2),
+            "duration_sec": duration_sec,
+            "duration_str": format_duration(duration_sec),
+            "format": ext,
+            "passed": is_passed,
+            "reason": " | ".join(reasons) if reasons else "合格"
+        }, None
+
+    except Exception as e:
+        return None, str(e)
+
+
+# 前端模板
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>视频质量检测系统</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        body { 
+            background-color: #f4f6f9; 
+            font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; 
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .wrapper { flex: 1; display: flex; flex-direction: column; }
+        .sidebar { min-height: 100vh; background: #212529; color: white; padding-top: 20px; }
+        .sidebar a { color: rgba(255,255,255,.7); text-decoration: none; padding: 12px 20px; display: block; border-left: 3px solid transparent; display: flex; align-items: center;}
+        .sidebar a i { margin-right: 10px; font-size: 1.1rem; }
+        .sidebar a:hover, .sidebar a.active { background: #2c3034; border-left-color: #0d6efd; color: white; }
+        .main-content { padding: 30px; flex: 1; }
+        .card-custom { border: none; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); background: white; margin-bottom: 20px; }
+        .spinner { display: inline-block; width: 1rem; height: 1rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spinner-border .75s linear infinite; margin-right: 5px; display: none; }
+        @keyframes spinner-border { to { transform: rotate(360deg); } }
+
+        .footer-info { text-align: center; padding: 10px; color: #adb5bd; font-size: 0.85rem; margin-top: auto; border-top: 1px solid #e9ecef; background-color: #fff; width: 100%; }
+        .login-footer { position: absolute; bottom: 10px; width: 100%; text-align: center; color: #adb5bd; font-size: 0.8rem; }
+        .login-input-custom::placeholder { font-size: 0.95rem; opacity: 0.6; }
+        .login-icon-box { width: 80px; height: 80px; background: #e7f1ff; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px auto; }
+    </style>
+</head>
+<body>
+
+<div class="wrapper">
+{% if not session.get('user') %}
+    <div class="container d-flex justify-content-center align-items-center" style="height: 90vh;">
+        <div class="card card-custom p-5 shadow-lg" style="width: 450px; position: relative;">
+            <div class="text-center mb-5">
+                <div class="login-icon-box">
+                    <i class="bi bi-camera-reels-fill" style="font-size: 2.5rem; color: #0d6efd;"></i>
+                </div>
+                <h3 class="text-primary fw-bold">系统登录</h3>
+                <p class="text-muted small">视频质量检测平台</p>
+            </div>
+            <form method="POST" action="/login">
+                <div class="mb-4">
+                    <label class="form-label fw-bold">用户 ID</label>
+                    <input type="text" name="username" class="form-control form-control-lg border-start-0 ps-2 login-input-custom" placeholder=" 例如: ID001" required autofocus style="border-left:none;">
+                </div>
+                <button type="submit" class="btn btn-primary w-100 btn-lg">进入系统</button>
+            </form>
+        </div>
+        <div class="login-footer">
+            <p class="mb-0">网页开发：吕佳忆</p>
+            <p class="mb-0">指导老师：张鸿文@BNU具身运动智能研究组</p>
+        </div>
+    </div>
+{% else %}
+    <div class="container-fluid p-0">
+        <div class="row g-0">
+            <div class="col-md-2 sidebar">
+                <h5 class="text-center mb-4"><i class="bi bi-film"></i> 视频检测系统</h5>
+                <div class="text-center mb-4 text-white-50 small">
+                    <i class="bi bi-person-circle fs-4 mb-1 d-block text-white"></i>
+                    当前用户: <span class="text-white">{{ session['user'] }}</span>
+                </div>
+                <a href="/" class="{% if not show_history %}active{% endif %}">
+                    <i class="bi bi-speedometer2"></i> 检测中心
+                </a>
+                <a href="/history" class="{% if show_history %}active{% endif %}">
+                    <i class="bi bi-clock-history"></i> 历史记录
+                </a>
+                <a href="/logout" class="text-danger mt-5">
+                    <i class="bi bi-box-arrow-right"></i> 退出登录
+                </a>
+            </div>
+
+            <div class="col-md-10 d-flex flex-column" style="min-height: 100vh;">
+                <div class="main-content">
+                    {% if show_history %}
+                        <div class="card card-custom p-4">
+                            <h4><i class="bi bi-clock-history text-primary"></i> 历史记录</h4>
+                            <table class="table table-hover mt-3 align-middle">
+                                <thead class="table-light"><tr><th>时间</th><th>用户</th><th>路径</th><th>结果 (合格/总数)</th></tr></thead>
+                                <tbody>
+                                    {% for row in history_data %}
+                                    <tr>
+                                        <td>{{ row.time }}</td>
+                                        <td>{{ row.user }}</td>
+                                        <td class="text-muted small">{{ row.path }}</td>
+                                        <td><span class="fw-bold text-success">{{ row.pass_count }}</span> / {{ row.total }}</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    {% else %}
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h3 class="fw-bold text-dark"><i class="bi bi-grid-1x2-fill text-primary"></i> 检测控制台</h3>
+                            <span class="badge bg-secondary px-3 py-2">标准: 4K (4:3) | 30FPS</span>
+                        </div>
+
+                        <div class="card card-custom p-4">
+                            <label class="form-label fw-bold">选择目录</label>
+                            <div class="input-group">
+                                <button class="btn btn-secondary" onclick="browseFolder()">
+                                    <span id="browseSpinner" class="spinner"></span> 📂浏览文件夹
+                                </button>
+                                <input type="text" id="folderPath" class="form-control" placeholder="请选择或粘贴文件夹路径...">
+                                <button class="btn btn-primary px-5 fw-bold" onclick="startScan()">
+                                    <span id="scanSpinner" class="spinner"></span> 
+                                    <i class="bi bi-search"></i> 开始检测
+                                </button>
+                            </div>
+                            <div class="mt-2" id="pathStatus"></div>
+                        </div>
+
+                        <div id="resultArea" style="display: none;">
+                            <div class="row mb-3">
+                                <div class="col-md-3">
+                                    <div class="card card-custom p-3 border-start border-success border-5">
+                                        <h6 class="text-success text-uppercase">合格视频</h6>
+                                        <h2 id="passCount" class="fw-bold">0</h2>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="card card-custom p-3 border-start border-danger border-5">
+                                        <h6 class="text-danger text-uppercase">不合格视频</h6>
+                                        <h2 id="failCount" class="fw-bold">0</h2>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="card card-custom p-3 border-start border-info border-5">
+                                        <h6 class="text-info text-uppercase">视频时长 (HH:MM:SS)</h6>
+                                        <div class="d-flex justify-content-between">
+                                            <div><small class="text-muted d-block">总时长</small><span id="totalDuration" class="fw-bold fs-5">00:00:00</span></div>
+                                            <div><small class="text-success d-block">有效时长</small><span id="validDuration" class="fw-bold fs-5 text-success">00:00:00</span></div>
+                                            <div><small class="text-danger d-block">无效时长</small><span id="invalidDuration" class="fw-bold fs-5 text-danger">00:00:00</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="card card-custom p-4 mb-3 border-start border-warning border-5">
+                                <h5 class="fw-bold mb-3"><i class="bi bi-folder2-open text-warning"></i> 文件夹时长统计</h5>
+
+                                <div class="mb-3">
+                                    <span class="badge bg-dark me-2">平均标准: ≥7小时</span>
+                                    <span class="badge bg-secondary">单文件夹标准: ≥6小时</span>
+                                </div>
+
+                                <div class="row align-items-center mb-3">
+                                    <div class="col-md-6">
+                                        <h6 class="text-muted">平均时长 (所有文件夹)</h6>
+                                        <div id="avgFolderStatus"></div>
+                                    </div>
+                                </div>
+
+                                <h6 class="text-muted">各文件夹详情:</h6>
+                                <div class="table-responsive" style="max-height: 200px;">
+                                    <table class="table table-sm table-hover mb-0">
+                                        <thead class="table-light">
+                                            <tr>
+                                                <th>文件夹名称</th>
+                                                <th>总时长</th>
+                                                <th class="text-success">有效采集时长</th>
+                                                <th>状态 (有效时长≥6h)</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="folderTableBody"></tbody>
+                                    </table>
+                                </div>
+
+                                <div class="mt-3 pt-3 border-top text-center">
+                                    <h5 class="text-secondary">最终合格天数 (有效时长达标)</h5>
+                                    <h2 class="fw-bold text-primary" id="finalQualifiedDays">0 天</h2>
+                                </div>
+                            </div>
+
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="card card-custom h-100">
+                                        <div class="card-header bg-danger text-white fw-bold"><i class="bi bi-x-circle-fill"></i> 不合格视频</div>
+                                        <div class="card-body p-0 table-responsive" style="max-height: 500px;">
+                                            <table class="table table-striped mb-0 small">
+                                                <thead class="table-light"><tr><th>文件名</th><th>时长</th><th>原因</th></tr></thead>
+                                                <tbody id="failTableBody"></tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="card card-custom h-100">
+                                        <div class="card-header bg-success text-white fw-bold"><i class="bi bi-check-circle-fill"></i> 合格视频</div>
+                                        <div class="card-body p-0 table-responsive" style="max-height: 500px;">
+                                            <table class="table table-striped mb-0 small">
+                                                <thead class="table-light"><tr><th>文件名</th><th>时长</th><th>详情</th></tr></thead>
+                                                <tbody id="passTableBody"></tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    {% endif %}
+                </div>
+                <div class="footer-info">
+                    <p class="mb-1">网页开发：吕佳忆</p>
+                    <p class="mb-0">指导老师：张鸿文@BNU具身运动智能研究组</p>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endif %}
+</div>
+
+<div class="modal fade" id="namingErrorModal" tabindex="-1" data-bs-backdrop="static">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content border-0 shadow-lg">
+      <div class="modal-header bg-warning text-dark">
+        <h5 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle-fill"></i> 目录或文件结构错误</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body text-center p-4">
+        <h4 class="text-danger mb-3">文件位置或命名不符合规范</h4>
+        <img src="/static/structure_guide.png" alt="命名规范参考图" class="img-fluid border rounded shadow-sm" style="max-height: 300px;">
+      </div>
+      <div class="modal-footer justify-content-center">
+        <button type="button" class="btn btn-primary px-5" data-bs-dismiss="modal">好的</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    function browseFolder() {
+        document.getElementById('browseSpinner').style.display = 'inline-block';
+        fetch('/api/browse_folder')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('browseSpinner').style.display = 'none';
+                if(data.path) document.getElementById('folderPath').value = data.path;
+            })
+            .catch(() => document.getElementById('browseSpinner').style.display = 'none');
+    }
+
+    function startScan() {
+        const path = document.getElementById('folderPath').value;
+        if(!path) return alert("请先选择文件夹");
+        document.getElementById('scanSpinner').style.display = 'inline-block';
+        document.getElementById('resultArea').style.display = 'none';
+        document.getElementById('pathStatus').innerHTML = '<span class="text-primary">正在扫描分析...</span>';
+
+        fetch('/api/scan', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: path})
+        })
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById('scanSpinner').style.display = 'none';
+            if(data.structure_error) {
+                document.getElementById('pathStatus').innerHTML = `<span class='text-danger fw-bold'>目录结构错误</span>`;
+                new bootstrap.Modal(document.getElementById('namingErrorModal')).show();
+                return;
+            }
+            if(data.error) {
+                document.getElementById('pathStatus').innerHTML = `<span class='text-danger'>${data.error}</span>`;
+                return;
+            }
+            document.getElementById('pathStatus').innerHTML = `<span class='text-success fw-bold'>检测完成，共发现 ${data.results.length} 个视频。</span>`;
+            renderResultTables(data);
+        })
+        .catch(err => {
+            document.getElementById('scanSpinner').style.display = 'none';
+            document.getElementById('pathStatus').innerText = "系统错误: " + err;
+        });
+    }
+
+    function renderResultTables(data) {
+        document.getElementById('resultArea').style.display = 'block';
+        const results = data.results;
+
+        // 渲染视频列表
+        const passBody = document.getElementById('passTableBody');
+        const failBody = document.getElementById('failTableBody');
+        passBody.innerHTML = ''; failBody.innerHTML = '';
+        let passCnt = 0; let failCnt = 0;
+
+        results.forEach(item => {
+            if(item.passed) {
+                passCnt++;
+                passBody.innerHTML += `<tr><td class="fw-bold">${item.filename}</td><td>${item.duration_str}</td><td>${item.width}x${item.height}, ${item.fps}fps</td></tr>`;
+            } else {
+                failCnt++;
+                failBody.innerHTML += `<tr><td class="fw-bold">${item.filename}</td><td>${item.duration_str}</td><td class="text-danger">${item.reason}</td></tr>`;
+            }
+        });
+        document.getElementById('passCount').innerText = passCnt;
+        document.getElementById('failCount').innerText = failCnt;
+        document.getElementById('totalDuration').innerText = data.total_duration;
+        document.getElementById('validDuration').innerText = data.valid_duration;
+        document.getElementById('invalidDuration').innerText = data.invalid_duration;
+
+        // --- 渲染文件夹统计 ---
+        const folderBody = document.getElementById('folderTableBody');
+        folderBody.innerHTML = '';
+
+        // 1. 文件夹列表
+        data.folder_results.forEach(f => {
+            const statusIcon = f.passed 
+                ? '<span class="badge bg-success">合格</span>' 
+                : '<span class="badge bg-danger">不合格 (有效不足6h)</span>';
+            const durationClass = 'text-muted'; 
+
+            folderBody.innerHTML += `
+                <tr>
+                    <td class="fw-bold">${f.name}</td>
+                    <td class="${durationClass}">${f.duration_str}</td>
+                    <td class="text-success fw-bold">${f.valid_duration_str}</td>
+                    <td>${statusIcon}</td>
+                </tr>
+            `;
+        });
+
+        // 2. 平均状态
+        const avgDiv = document.getElementById('avgFolderStatus');
+        const avgClass = data.global_stats.avg_passed ? 'text-success' : 'text-danger';
+        const avgIcon = data.global_stats.avg_passed ? '<i class="bi bi-check-circle-fill"></i>' : '<i class="bi bi-x-circle-fill"></i>';
+
+        avgDiv.innerHTML = `
+            <h3 class="${avgClass} fw-bold">
+                ${avgIcon} ${data.global_stats.avg_duration_str}
+            </h3>
+            <small class="text-muted">${data.global_stats.avg_passed ? '平均时长达标' : '平均时长未达标 (需≥7小时)'}</small>
+        `;
+
+        // 3. 最终合格天数
+        document.getElementById('finalQualifiedDays').innerText = `${data.global_stats.qualified_days} 天`;
+    }
+</script>
+</body>
+</html>
+"""
+
+
+@app.route('/', methods=['GET', 'POST'])
+def index(): return render_template_string(HTML_TEMPLATE, show_history=False)
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form.get('username')
+    if username and username.strip():
+        session['user'] = username.strip()
+        return redirect('/')
+    return render_template_string(HTML_TEMPLATE, error="ID 不能为空")
+
+
+@app.route('/logout')
+def logout(): session.clear(); return redirect('/')
+
+
+@app.route('/history')
+def history():
+    if not session.get('user'): return redirect('/')
+    all_data = load_history()
+    user_data = [d for d in all_data if d['user'] == session['user']]
+    return render_template_string(HTML_TEMPLATE, show_history=True, history_data=reversed(user_data))
+
+
+@app.route('/api/browse_folder')
+def api_browse_folder():
+    path = open_folder_dialog()
+    if path: path = path.replace('\\', '/')
+    return jsonify({'path': path})
+
+
+# --- 核心修改：逻辑修正 ---
+@app.route('/api/scan', methods=['POST'])
+def api_scan():
+    if not session.get('user'): return jsonify({'error': '未登录'}), 401
+    raw_path = request.json.get('path', '')
+    path = clean_path(raw_path)
+    if not path or not os.path.exists(path): return jsonify({'error': '路径不存在'}), 400
+    if not os.path.isdir(path): return jsonify({'error': '请选择一个文件夹'}), 400
+
+    results = []
+    folder_duration_map = {}  # 总时长
+    folder_valid_duration_map = {}  # 有效时长
+
+    filename_pattern = re.compile(r"^(.+)-(\d{6})-(\d{2})\.(mp4|mov|avi|mkv)$", re.IGNORECASE)
+    found_videos = False
+
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                found_videos = True
+                match = filename_pattern.match(f)
+                if not match: return jsonify({'structure_error': True})
+
+                file_id, file_date = match.group(1), match.group(2)
+                if os.path.basename(root) != f"{file_id}-{file_date}":
+                    return jsonify({'structure_error': True})
+
+                full_path = os.path.join(root, f)
+                info, err = get_video_info(full_path)
+                if info:
+                    results.append(info)
+
+                    # 1. 总时长
+                    folder_duration_map[root] = folder_duration_map.get(root, 0) + info['duration_sec']
+
+                    # 2. 有效时长 (只累加 passed=True 的视频)
+                    current_valid = folder_valid_duration_map.get(root, 0)
+                    if info['passed']:
+                        folder_valid_duration_map[root] = current_valid + info['duration_sec']
+                    else:
+                        if root not in folder_valid_duration_map:
+                            folder_valid_duration_map[root] = 0
+
+    if not found_videos: return jsonify({'error': '未找到视频文件'}), 404
+
+    folder_results = []
+    total_folders_duration = 0
+    qualified_days_count = 0  # 最终合格天数 (按有效时长算)
+
+    for folder_path, duration in folder_duration_map.items():
+        valid_duration = folder_valid_duration_map.get(folder_path, 0)
+
+        # --- 关键修改：判定单文件夹是否合格，使用有效时长 valid_duration ---
+        is_folder_passed = valid_duration >= DURATION_Threshold_Folder
+
+        if is_folder_passed:
+            qualified_days_count += 1
+
+        folder_results.append({
+            'name': os.path.basename(folder_path),
+            'duration_sec': duration,
+            'duration_str': format_duration(duration),
+            'valid_duration_sec': valid_duration,
+            'valid_duration_str': format_duration(valid_duration),
+            'passed': is_folder_passed
+        })
+        total_folders_duration += duration
+
+    num_folders = len(folder_duration_map)
+    avg_duration = total_folders_duration / num_folders if num_folders > 0 else 0
+    avg_passed = avg_duration >= DURATION_Threshold_Avg
+
+    pass_cnt = sum(1 for r in results if r['passed'])
+    total_sec = sum(r['duration_sec'] for r in results)
+    valid_sec = sum(r['duration_sec'] for r in results if r['passed'])
+    invalid_sec = sum(r['duration_sec'] for r in results if not r['passed'])
+
+    save_history_record({
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": session['user'],
+        "path": path,
+        "pass_count": pass_cnt,
+        "total": len(results)
+    })
+
+    return jsonify({
+        'results': results,
+        'folder_results': folder_results,
+        'global_stats': {
+            'avg_duration_sec': avg_duration,
+            'avg_duration_str': format_duration(avg_duration),
+            'avg_passed': avg_passed,
+            'folder_count': num_folders,
+            'qualified_days': qualified_days_count
+        },
+        'total_duration': format_duration(total_sec),
+        'valid_duration': format_duration(valid_sec),
+        'invalid_duration': format_duration(invalid_sec)
+    })
+
+
+def open_browser(port):
+    webbrowser.open_new(f'http://127.0.0.1:{port}/')
+
+
+if __name__ == '__main__':
+    if not os.path.exists('static'): os.makedirs('static')
+
+    port = find_free_port(5555)
+
+    print(f"系统启动中... 请访问 http://127.0.0.1:{port}")
+
+    if not os.environ.get("WERKZEUG_RUN_MAIN"):
+        Timer(1.5, open_browser, [port]).start()
+
+    app.run(host='0.0.0.0', port=port, debug=False)
