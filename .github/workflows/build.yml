@@ -9,15 +9,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # 在这三个系统上分别运行测试
         os: [windows-latest, ubuntu-latest, macos-latest]
-      fail-fast: false # 如果一个系统挂了，不要取消其他系统的测试（方便排查）
+      fail-fast: false
 
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
-      # 统一使用 Python 3.8 进行测试，确保和打包环境一致
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -31,13 +29,12 @@ jobs:
 
       - name: 🧪 Run Pytest
         run: |
-          # 运行测试脚本
           pytest -v tests/
 
   # === 第二阶段：全平台打包 (依赖测试通过) ===
   build:
     name: Build on ${{ matrix.os }}
-    needs: test  # <--- 必须等上面的 test 任务全部绿了，这里才会开始
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -92,8 +89,10 @@ jobs:
           mode: onefile
           enable-plugins: tk-inter
           include-data-dir: static=static
+          # 这里您已经写对了，确保生成 .command 文件
           output-file: VideoQC_Mac.command
 
+      # --- 上传产物 (关键修改点) ---
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -101,3 +100,4 @@ jobs:
           path: |
             **/*.exe
             **/*.bin
+            **/*.command  
