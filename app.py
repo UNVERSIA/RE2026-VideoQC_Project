@@ -16,6 +16,7 @@ from flask import Flask, render_template_string, request, jsonify, session, redi
 
 
 def resource_path(relative_path):
+    """获取资源的绝对路径 (适配 Nuitka 和 PyInstaller)"""
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -78,55 +79,29 @@ def save_history_record(record):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-# --- macOS 弹窗优化  ---
+# macOS 弹窗
 def open_folder_dialog():
     system_name = platform.system()
 
     if system_name == 'Darwin':
-        osa_cmd = '/usr/bin/osascript'
-
-        script_finder = '''
-        tell application "Finder"
-            activate
-            try
-                set f to choose folder with prompt "请选择包含视频的文件夹"
-                return POSIX path of f
-            on error
-                return "CANCEL"
-            end try
-        end tell
-        '''
-
-        script_sys = '''
-        tell application "System Events"
-            activate
-            try
-                set f to choose folder with prompt "请选择包含视频的文件夹"
-                return POSIX path of f
-            on error
-                return "CANCEL"
-            end try
-        end tell
-        '''
-
         try:
-            # 1. 尝试 Finder 弹窗
-            result = subprocess.run([osa_cmd, '-e', script_finder], capture_output=True, text=True, timeout=60)
-            output = result.stdout.strip()
+            script = '''
+            tell application "Finder"
+                activate
+                try
+                    set f to choose folder with prompt "请选择包含视频的文件夹"
+                    return POSIX path of f
+                on error
+                    return ""
+                end try
+            end tell
+            '''
 
-            if "CANCEL" in output: return ""
-            if output: return output
+            result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=60)
 
-            # 2. 如果 Finder 失败（通常是没返回路径），尝试 System Events
-            print("Finder 调用失败，尝试 System Events...")
-            result = subprocess.run([osa_cmd, '-e', script_sys], capture_output=True, text=True, timeout=60)
-            output = result.stdout.strip()
-
-            if "CANCEL" in output: return ""
-            if output: return output
-
+            if result.returncode == 0:
+                return result.stdout.strip()
             return ""
-
         except subprocess.TimeoutExpired:
             print("macOS Dialog Timeout")
             return ""
@@ -135,7 +110,6 @@ def open_folder_dialog():
             return ""
 
     else:
-        # Windows / Linux 逻辑不变
         try:
             root = tk.Tk()
             root.withdraw()
@@ -366,7 +340,7 @@ HTML_TEMPLATE = """
 
                                 <div class="row align-items-center mb-3">
                                     <div class="col-md-6">
-                                        <h6 class="text-muted">平均时长 (所有文件夹)</h6>
+                                        <h6 class="text-muted">平均时长 (达标文件夹)</h6>
                                         <div id="avgFolderStatus"></div>
                                     </div>
                                 </div>
@@ -548,7 +522,7 @@ HTML_TEMPLATE = """
             <h3 class="${avgClass} fw-bold">
                 ${avgIcon} ${data.global_stats.avg_duration_str}
             </h3>
-            <small class="text-muted">${data.global_stats.avg_passed ? '平均时长达标' : '平均时长未达标 (需≥7小时)'}</small>
+            <small class="text-muted">${data.global_stats.avg_passed ? '平均有效采集时长达标' : '平均有效采集时长未达标 (需≥7小时)'}</small>
         `;
 
         // 3. 最终合格天数
@@ -592,7 +566,6 @@ def api_browse_folder():
     return jsonify({'path': path})
 
 
-# --- 核心修改：逻辑修正 ---
 @app.route('/api/scan', methods=['POST'])
 def api_scan():
     if not session.get('user'): return jsonify({'error': '未登录'}), 401
@@ -627,7 +600,7 @@ def api_scan():
                     # 1. 总时长
                     folder_duration_map[root] = folder_duration_map.get(root, 0) + info['duration_sec']
 
-                    # 2. 有效时长 (只累加 passed=True 的视频)
+                    # 2. 有效时长
                     current_valid = folder_valid_duration_map.get(root, 0)
                     if info['passed']:
                         folder_valid_duration_map[root] = current_valid + info['duration_sec']
@@ -639,16 +612,18 @@ def api_scan():
 
     folder_results = []
     total_folders_duration = 0
-    qualified_days_count = 0  # 最终合格天数 (按有效时长算)
+    total_qualified_valid_duration = 0
+    qualified_days_count = 0
 
     for folder_path, duration in folder_duration_map.items():
         valid_duration = folder_valid_duration_map.get(folder_path, 0)
 
-        # --- 关键修改：判定单文件夹是否合格，使用有效时长 valid_duration ---
+        # 判定单文件夹是否合格
         is_folder_passed = valid_duration >= DURATION_Threshold_Folder
 
         if is_folder_passed:
             qualified_days_count += 1
+            total_qualified_valid_duration += valid_duration  # 累加达标天数的时长
 
         folder_results.append({
             'name': os.path.basename(folder_path),
@@ -660,8 +635,12 @@ def api_scan():
         })
         total_folders_duration += duration
 
-    num_folders = len(folder_duration_map)
-    avg_duration = total_folders_duration / num_folders if num_folders > 0 else 0
+    # 计算平均时长
+    if qualified_days_count > 0:
+        avg_duration = total_qualified_valid_duration / qualified_days_count
+    else:
+        avg_duration = 0
+
     avg_passed = avg_duration >= DURATION_Threshold_Avg
 
     pass_cnt = sum(1 for r in results if r['passed'])
@@ -684,7 +663,7 @@ def api_scan():
             'avg_duration_sec': avg_duration,
             'avg_duration_str': format_duration(avg_duration),
             'avg_passed': avg_passed,
-            'folder_count': num_folders,
+            'folder_count': len(folder_duration_map),
             'qualified_days': qualified_days_count
         },
         'total_duration': format_duration(total_sec),
